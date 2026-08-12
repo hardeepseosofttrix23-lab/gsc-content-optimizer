@@ -18,7 +18,7 @@ st.write(
 
 uploaded_file = st.file_uploader(
     "Upload your GSC Performance ZIP",
-    type=["zip"]
+    type=["zip", "csv", "xlsx", "xls"]
 )
 
 if uploaded_file is not None:
