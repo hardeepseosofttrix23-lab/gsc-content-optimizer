@@ -10,21 +10,25 @@ st.set_page_config(
 st.title("📈 GSC Content Optimizer")
 
 st.write(
-    "Upload your Google Search Console Performance CSV "
+    "Upload your Google Search Console Performance file "
     "to identify content optimization opportunities."
 )
 
 uploaded_file = st.file_uploader(
-    "Upload your GSC CSV",
-    type=["csv"]
+    "Upload your GSC Performance file",
+    type=["csv", "xlsx"]
 )
 
 if uploaded_file is not None:
 
     try:
-        df = pd.read_csv(uploaded_file)
+        # Read CSV or Excel
+        if uploaded_file.name.endswith(".csv"):
+            df = pd.read_csv(uploaded_file)
+        else:
+            df = pd.read_excel(uploaded_file)
 
-        st.success("CSV uploaded successfully!")
+        st.success("File uploaded successfully!")
 
         st.subheader("Data Preview")
 
@@ -52,8 +56,12 @@ if uploaded_file is not None:
             else:
                 st.metric("Unique URLs", "N/A")
 
+        st.subheader("Available Columns")
+
+        st.write(list(df.columns))
+
     except Exception as e:
 
         st.error(
-            f"Unable to read the CSV file: {e}"
+            f"Unable to read the file: {e}"
         )
