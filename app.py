@@ -1,1468 +1,474 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import zipfile
 import io
 import re
-from urllib.parse import urlparse
-from datetime import timedelta
+import zipfile
+from datetime import date, timedelta
 
-# ============================================================
-# PAGE CONFIG
-# ============================================================
+import numpy as np
+import pandas as pd
+import requests
+from bs4 import BeautifulSoup
+import streamlit as st
 
-st.set_page_config(
-    page_title="GSC Content Optimizer",
-    page_icon="📈",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# Google API
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
 
-# ============================================================
-# CUSTOM CSS
-# ============================================================
+st.set_page_config(page_title="GSC Content Optimizer", page_icon="📈", layout="wide")
 
+# ---------------------------
+# Theme
+# ---------------------------
 st.markdown("""
 <style>
-
-.main {
-    background-color: #f7f8fa;
-}
-
-.block-container {
-    padding-top: 2rem;
-    padding-bottom: 4rem;
-}
-
-.hero {
-    padding: 30px;
-    border-radius: 18px;
-    background: linear-gradient(135deg, #111827, #263449);
-    color: white;
-    margin-bottom: 25px;
-}
-
-.hero h1 {
-    font-size: 42px;
-    margin-bottom: 8px;
-}
-
-.hero p {
-    color: #d1d5db;
-    font-size: 17px;
-}
-
-.metric-card {
-    background: white;
-    border: 1px solid #e5e7eb;
-    border-radius: 14px;
-    padding: 20px;
-    min-height: 125px;
-}
-
-.metric-title {
-    font-size: 13px;
-    color: #6b7280;
-}
-
-.metric-value {
-    font-size: 30px;
-    font-weight: 700;
-    margin-top: 8px;
-}
-
-.priority-high {
-    background: #fee2e2;
-    color: #991b1b;
-    padding: 5px 10px;
-    border-radius: 20px;
-    font-weight: 600;
-}
-
-.priority-medium {
-    background: #fef3c7;
-    color: #92400e;
-    padding: 5px 10px;
-    border-radius: 20px;
-    font-weight: 600;
-}
-
-.priority-low {
-    background: #dcfce7;
-    color: #166534;
-    padding: 5px 10px;
-    border-radius: 20px;
-    font-weight: 600;
-}
-
-.section-title {
-    font-size: 26px;
-    font-weight: 700;
-    margin-top: 30px;
-    margin-bottom: 15px;
-}
-
-.info-box {
-    background: #eff6ff;
-    border-left: 5px solid #2563eb;
-    padding: 15px;
-    border-radius: 8px;
-    margin: 10px 0;
-}
-
-.warning-box {
-    background: #fff7ed;
-    border-left: 5px solid #f97316;
-    padding: 15px;
-    border-radius: 8px;
-    margin: 10px 0;
-}
-
+.main .block-container {max-width:1450px;padding-top:1.2rem;}
+.hero{padding:28px 32px;border-radius:18px;background:linear-gradient(135deg,#111827,#26354f);color:#fff;margin-bottom:20px}
+.hero h1{font-size:42px;margin:0 0 8px}
+.hero p{font-size:17px;margin:0;opacity:.9}
+.badge{display:inline-block;padding:4px 9px;border-radius:999px;font-size:12px;font-weight:700}
+.high{background:#fee2e2;color:#991b1b}.medium{background:#fef3c7;color:#92400e}.low{background:#d1fae5;color:#065f46}
+.section{margin-top:18px}
 </style>
 """, unsafe_allow_html=True)
 
-
-# ============================================================
-# HELPERS
-# ============================================================
-
-def normalize_columns(df):
-    df.columns = [
-        str(c).strip().lower().replace(" ", "_")
-        for c in df.columns
-    ]
-    return df
-
-
-def find_column(df, possible_names):
-    for name in possible_names:
-        if name in df.columns:
-            return name
-    return None
-
-
-def clean_numeric(series):
-    if series is None:
-        return pd.Series(dtype=float)
-
-    return (
-        series.astype(str)
-        .str.replace("%", "", regex=False)
-        .str.replace(",", "", regex=False)
-        .str.strip()
-        .replace(["-", "", "nan", "None"], np.nan)
-        .astype(float)
-    )
-
-
-def calculate_ctr(clicks, impressions):
-    if impressions == 0:
-        return 0
-    return (clicks / impressions) * 100
-
-
-def safe_position(value):
-    try:
-        return float(value)
-    except:
-        return np.nan
-
-
-def format_number(value):
-    try:
-        return f"{value:,.0f}"
-    except:
-        return "0"
-
-
-def score_priority(row):
-    """
-    Rule-based SEO opportunity score.
-
-    Higher score = stronger optimization opportunity.
-    """
-
-    impressions = row.get("impressions", 0)
-    clicks = row.get("clicks", 0)
-    ctr = row.get("ctr", 0)
-    position = row.get("position", 100)
-
-    score = 0
-
-    # --------------------------------------------------------
-    # Impression opportunity
-    # --------------------------------------------------------
-
-    if impressions >= 10000:
-        score += 25
-    elif impressions >= 5000:
-        score += 22
-    elif impressions >= 2000:
-        score += 18
-    elif impressions >= 1000:
-        score += 14
-    elif impressions >= 500:
-        score += 9
-    elif impressions >= 100:
-        score += 5
-
-    # --------------------------------------------------------
-    # Ranking opportunity
-    # --------------------------------------------------------
-
-    if 4 <= position <= 10:
-        score += 30
-    elif 11 <= position <= 20:
-        score += 25
-    elif 21 <= position <= 30:
-        score += 12
-    elif 1 <= position < 4:
-        score += 5
-
-    # --------------------------------------------------------
-    # CTR opportunity
-    # --------------------------------------------------------
-
-    if 4 <= position <= 10:
-        expected_ctr = 8
-    elif 11 <= position <= 20:
-        expected_ctr = 4
-    else:
-        expected_ctr = 2
-
-    if ctr < expected_ctr * 0.5:
-        score += 20
-    elif ctr < expected_ctr * 0.75:
-        score += 12
-    elif ctr < expected_ctr:
-        score += 6
-
-    # --------------------------------------------------------
-    # Existing clicks
-    # --------------------------------------------------------
-
-    if clicks >= 500:
-        score += 10
-    elif clicks >= 100:
-        score += 7
-    elif clicks >= 25:
-        score += 4
-
-    # --------------------------------------------------------
-    # Avoid optimizing already excellent keywords
-    # --------------------------------------------------------
-
-    if position <= 3 and ctr >= expected_ctr:
-        score -= 25
-
-    return max(0, min(100, score))
-
-
-def classify_opportunity(row):
-
-    position = row["position"]
-    impressions = row["impressions"]
-    ctr = row["ctr"]
-
-    if position <= 3 and impressions >= 500:
-        return "PROTECT"
-
-    if 4 <= position <= 10 and impressions >= 500:
-        return "STRIKING DISTANCE"
-
-    if 11 <= position <= 20 and impressions >= 500:
-        return "PAGE 2 OPPORTUNITY"
-
-    if position <= 10 and impressions >= 500 and ctr < 2:
-        return "CTR OPPORTUNITY"
-
-    if impressions >= 2000 and position > 20:
-        return "CONTENT OPPORTUNITY"
-
-    return "LOW PRIORITY"
-
-
-def recommendation(row):
-
-    position = row["position"]
-    ctr = row["ctr"]
-    impressions = row["impressions"]
-
-    if position <= 3:
-        return (
-            "Protect the existing page. Avoid major content changes. "
-            "Focus on internal linking, freshness and monitoring."
-        )
-
-    if 4 <= position <= 10:
-        if ctr < 3:
-            return (
-                "Prioritize the existing ranking page. Review title, "
-                "meta description, search intent alignment, H1/H2 structure "
-                "and expand missing topical coverage."
-            )
-
-        return (
-            "Optimize the existing ranking page. Improve topical depth, "
-            "search intent alignment, internal links and supporting sections."
-        )
-
-    if 11 <= position <= 20:
-        return (
-            "Refresh the existing page before creating a new page. "
-            "Expand topical coverage, improve headings, strengthen internal "
-            "links and answer missing search-intent questions."
-        )
-
-    if position > 20 and impressions >= 2000:
-        return (
-            "Investigate the ranking page. Check relevance and content depth "
-            "before deciding whether to refresh the existing URL or create "
-            "a dedicated page."
-        )
-
-    return "Low priority. Monitor before making major content changes."
-
-
-# ============================================================
-# ZIP READER
-# ============================================================
-
-def read_zip(uploaded_file):
-
-    files = {}
-
-    with zipfile.ZipFile(uploaded_file) as z:
-
-        for name in z.namelist():
-
-            if name.lower().endswith(".csv"):
-
-                try:
-
-                    data = z.read(name)
-
-                    df = pd.read_csv(
-                        io.BytesIO(data),
-                        encoding="utf-8",
-                        on_bad_lines="skip"
-                    )
-
-                    files[name.split("/")[-1]] = normalize_columns(df)
-
-                except Exception:
-                    pass
-
-    return files
-
-
-# ============================================================
-# DATE ANALYSIS
-# ============================================================
-
-def analyze_chart(chart):
-
-    if chart is None:
-        return None
-
-    date_col = find_column(
-        chart,
-        ["date"]
-    )
-
-    if not date_col:
-        return None
-
-    chart = chart.copy()
-
-    chart[date_col] = pd.to_datetime(
-        chart[date_col],
-        errors="coerce"
-    )
-
-    chart = chart.dropna(subset=[date_col])
-
-    click_col = find_column(chart, ["clicks"])
-    impression_col = find_column(chart, ["impressions"])
-
-    if click_col:
-        chart[click_col] = clean_numeric(chart[click_col])
-
-    if impression_col:
-        chart[impression_col] = clean_numeric(chart[impression_col])
-
-    return chart
-
-
-# ============================================================
-# FIND QUERY DATA
-# ============================================================
-
-def prepare_queries(df):
-
-    if df is None:
-        return None
-
-    q = df.copy()
-
-    query_col = find_column(
-        q,
-        ["query", "queries", "keyword"]
-    )
-
-    clicks_col = find_column(
-        q,
-        ["clicks"]
-    )
-
-    impressions_col = find_column(
-        q,
-        ["impressions"]
-    )
-
-    ctr_col = find_column(
-        q,
-        ["ctr"]
-    )
-
-    position_col = find_column(
-        q,
-        ["position", "average_position"]
-    )
-
-    if not query_col:
-        return None
-
-    q = q.rename(
-        columns={
-            query_col: "query",
-            clicks_col: "clicks" if clicks_col else query_col,
-            impressions_col: "impressions" if impressions_col else query_col,
-            ctr_col: "ctr" if ctr_col else query_col,
-            position_col: "position" if position_col else query_col,
-        }
-    )
-
-    if "clicks" not in q.columns:
-        q["clicks"] = 0
-
-    if "impressions" not in q.columns:
-        q["impressions"] = 0
-
-    if "ctr" not in q.columns:
-        q["ctr"] = 0
-
-    if "position" not in q.columns:
-        q["position"] = 100
-
-    q["clicks"] = clean_numeric(q["clicks"])
-    q["impressions"] = clean_numeric(q["impressions"])
-    q["ctr"] = clean_numeric(q["ctr"])
-    q["position"] = clean_numeric(q["position"])
-
-    q = q.dropna(subset=["query"])
-
-    q["query"] = q["query"].astype(str).str.strip()
-
-    q = q[q["query"] != ""]
-
-    return q
-
-
-# ============================================================
-# FIND PAGE DATA
-# ============================================================
-
-def prepare_pages(df):
-
-    if df is None:
-        return None
-
-    p = df.copy()
-
-    page_col = find_column(
-        p,
-        ["top_pages", "page", "url", "pages"]
-    )
-
-    clicks_col = find_column(p, ["clicks"])
-    impressions_col = find_column(p, ["impressions"])
-    ctr_col = find_column(p, ["ctr"])
-    position_col = find_column(p, ["position", "average_position"])
-
-    if not page_col:
-        return None
-
-    rename = {
-        page_col: "page"
-    }
-
-    if clicks_col:
-        rename[clicks_col] = "clicks"
-
-    if impressions_col:
-        rename[impressions_col] = "impressions"
-
-    if ctr_col:
-        rename[ctr_col] = "ctr"
-
-    if position_col:
-        rename[position_col] = "position"
-
-    p = p.rename(columns=rename)
-
-    for col in ["clicks", "impressions", "ctr", "position"]:
-        if col not in p.columns:
-            p[col] = 0
-
-    p["clicks"] = clean_numeric(p["clicks"])
-    p["impressions"] = clean_numeric(p["impressions"])
-    p["ctr"] = clean_numeric(p["ctr"])
-    p["position"] = clean_numeric(p["position"])
-
-    return p
-
-
-# ============================================================
-# DETECT DAILY QUERY DATA
-# ============================================================
-
-def detect_daily_query_data(files):
-
-    for name, df in files.items():
-
-        if "query" not in " ".join(df.columns):
-            continue
-
-        date_col = find_column(df, ["date"])
-
-        query_col = find_column(
-            df,
-            ["query", "queries", "keyword"]
-        )
-
-        if date_col and query_col:
-            return df
-
-    return None
-
-
-# ============================================================
-# APP
-# ============================================================
-
 st.markdown("""
 <div class="hero">
-
 <h1>📈 GSC Content Optimizer</h1>
-
-<p>
-Turn Google Search Console data into a prioritized SEO content
-optimization plan — not a list of thousands of keywords.
-</p>
-
+<p>Find the keywords and pages most worth optimizing, explain why, and turn Search Console data into an actionable content plan.</p>
 </div>
 """, unsafe_allow_html=True)
 
+# ---------------------------
+# Constants / utility
+# ---------------------------
+GSC_SCOPE = "https://www.googleapis.com/auth/webmasters.readonly"
 
-# ============================================================
-# SIDEBAR
-# ============================================================
+def norm_col(x):
+    return re.sub(r"[^a-z0-9]", "", str(x).strip().lower())
 
+def find_col(df, candidates):
+    mapping = {norm_col(c): c for c in df.columns}
+    for candidate in candidates:
+        if norm_col(candidate) in mapping:
+            return mapping[norm_col(candidate)]
+    for c in df.columns:
+        nc = norm_col(c)
+        for candidate in candidates:
+            if norm_col(candidate) in nc or nc in norm_col(candidate):
+                return c
+    return None
+
+def parse_percent(s):
+    if pd.api.types.is_numeric_dtype(s):
+        v = pd.to_numeric(s, errors="coerce")
+        return v/100 if v.dropna().median() > 1 else v
+    return pd.to_numeric(s.astype(str).str.replace("%","",regex=False), errors="coerce")/100
+
+def standardize(df):
+    x=df.copy(); r={}
+    for candidates,target in [
+        (["query","queries","top queries","search query"],"Query"),
+        (["page","pages","top pages","url"],"Page"),
+        (["date"],"Date"),
+        (["clicks"],"Clicks"),
+        (["impressions"],"Impressions"),
+        (["ctr"],"CTR"),
+        (["position","avg position","average position"],"Position"),
+    ]:
+        c=find_col(x,candidates)
+        if c:r[c]=target
+    x=x.rename(columns=r)
+    if "Date" in x:x["Date"]=pd.to_datetime(x["Date"],errors="coerce")
+    for c in ["Clicks","Impressions","Position"]:
+        if c in x:x[c]=pd.to_numeric(x[c],errors="coerce")
+    if "CTR" in x:x["CTR"]=parse_percent(x["CTR"])
+    return x
+
+def classify_dataset(df):
+    cols={norm_col(c) for c in df.columns}
+    q=any(c=="query" or "topqueries" in c or "searchquery" in c for c in cols)
+    p=any(c=="page" or "toppages" in c or c=="url" for c in cols)
+    d="date" in cols
+    m=any("clicks" in c for c in cols) and any("impressions" in c for c in cols)
+    if q and p:return "query_page"
+    if q:return "query"
+    if p:return "page"
+    if d and m:return "daily"
+    return "other"
+
+def read_gsc_zip(upload):
+    datasets={}
+    with zipfile.ZipFile(upload) as z:
+        for name in z.namelist():
+            if name.endswith("/") or not name.lower().endswith((".csv",".xlsx",".xls")): continue
+            raw=z.read(name)
+            try:
+                df=pd.read_csv(io.BytesIO(raw)) if name.lower().endswith(".csv") else pd.read_excel(io.BytesIO(raw))
+            except Exception:
+                try: df=pd.read_csv(io.BytesIO(raw),encoding="latin-1")
+                except Exception: continue
+            if not df.empty:
+                s=standardize(df)
+                datasets[name]=(classify_dataset(s),s)
+    return datasets
+
+def ctr_benchmark(pos):
+    # Conservative heuristic benchmark used only to identify opportunities.
+    if pos <= 1.5:return .30
+    if pos <= 3:return .12
+    if pos <= 5:return .07
+    if pos <= 10:return .035
+    if pos <= 20:return .015
+    if pos <= 30:return .008
+    return .003
+
+def intent_for_query(q, locations):
+    q=str(q).lower().strip()
+    local_terms=["near me","nearby","in my area","local","service area"]
+    commercial=["hire","book","buy","service","services","company","agency","provider","cost","price","pricing","quote","appointment"]
+    info=["how","what","why","when","guide","tips","ideas","checklist","vs ","versus","difference","meaning"]
+    if any(x in q for x in local_terms) or any(loc and loc.lower() in q for loc in locations):
+        return "Local Commercial"
+    if any(x in q for x in commercial):return "Commercial"
+    if any(x in q for x in info):return "Informational"
+    return "Mixed / Unknown"
+
+def clean_domain(url):
+    if not url:return ""
+    try:return re.sub(r"^www\.","",urlparse(url).netloc.lower())
+    except:return ""
+
+def brand_query(q, domain):
+    host=clean_domain(domain)
+    if not host:return False
+    brand=host.split(".")[0]
+    toks=set(re.findall(r"[a-z0-9]+",str(q).lower()))
+    return brand in toks
+
+def query_page_aggregate(df):
+    if df.empty or not {"Query","Page","Clicks","Impressions","CTR","Position"}.issubset(df.columns):
+        return pd.DataFrame()
+    x=df.copy()
+    x=x[x["Query"].notna() & x["Page"].notna()]
+    x["Clicks"]=x["Clicks"].fillna(0);x["Impressions"]=x["Impressions"].fillna(0)
+    g=x.groupby(["Query","Page"],as_index=False).agg(Clicks=("Clicks","sum"),Impressions=("Impressions","sum"))
+    x["wpos"]=x["Position"].fillna(100)*x["Impressions"]
+    wp=x.groupby(["Query","Page"],as_index=False)["wpos"].sum()
+    g=g.merge(wp,on=["Query","Page"])
+    g["Position"]=g["wpos"]/g["Impressions"].replace(0,np.nan)
+    g["CTR"]=g["Clicks"]/g["Impressions"].replace(0,np.nan)
+    return g.drop(columns=["wpos"])
+
+def fetch_gsc(service, site, start, end, dims, row_limit=25000):
+    rows=[]; start_row=0
+    while True:
+        body={"startDate":str(start),"endDate":str(end),"dimensions":dims,"rowLimit":row_limit,"startRow":start_row,"dataState":"final"}
+        resp=service.searchanalytics().query(siteUrl=site,body=body).execute()
+        batch=resp.get("rows",[])
+        for r in batch:
+            rec=dict(zip(dims,r.get("keys",[])))
+            rec.update({k:r.get(k,0) for k in ["clicks","impressions","ctr","position"]})
+            rows.append(rec)
+        if len(batch)<row_limit:break
+        start_row += row_limit
+        if start_row >= 100000: break
+    if not rows:return pd.DataFrame()
+    x=pd.DataFrame(rows)
+    rename={"query":"Query","page":"Page","date":"Date","clicks":"Clicks","impressions":"Impressions","ctr":"CTR","position":"Position"}
+    x=x.rename(columns=rename)
+    if "Date" in x:x["Date"]=pd.to_datetime(x["Date"],errors="coerce")
+    return x
+
+def score_row(r):
+    imp=float(r["Impressions"]); pos=float(r["Position"]); ctr=float(r["CTR"])
+    volume=min(1,np.log10(max(imp,1))/5)
+    rank=1 if 4<=pos<=15 else .7 if 15<pos<=20 else .35 if 20<pos<=40 else .15 if pos<=3 else .05
+    ctr_gap=max(0,ctr_benchmark(pos)-ctr)/max(ctr_benchmark(pos),.001)
+    intent={"Local Commercial":1.0,"Commercial":.95,"Mixed / Unknown":.55,"Informational":.35}.get(r["Intent"],.35)
+    trend=r.get("Trend",0)
+    trend_factor=.5 if trend < -0.15 else .75 if trend < 0 else 1 if trend < .15 else 1.1
+    return round(100*(.30*volume+.30*rank+.20*min(1,ctr_gap)+.15*intent+.05*min(1,trend_factor)),1)
+
+def choose_action(r):
+    p=r["Position"]; ctr=r["CTR"]; imp=r["Impressions"]
+    if p<=3 and ctr>=ctr_benchmark(p)*.8:
+        return "PROTECT"
+    if 4<=p<=10 and ctr<ctr_benchmark(p)*.65:
+        return "CTR + CONTENT"
+    if 4<=p<=10:
+        return "CONTENT REFRESH"
+    if 10<p<=20:
+        return "PUSH TO PAGE 1"
+    if 20<p<=40 and imp>=200:
+        return "RELEVANCE / CONTENT GAP"
+    if r["Intent"] in ["Commercial","Local Commercial"] and imp>=100:
+        return "REVIEW TARGET PAGE"
+    return "MONITOR"
+
+def recommendation_text(r):
+    q=r["Query"]; p=r["Page"]; pos=r["Position"]; intent=r["Intent"]; ctr=r["CTR"]
+    actions={
+        "PROTECT":"Keep this page focused on its current intent. Avoid a major rewrite unless there is a verified content problem.",
+        "CTR + CONTENT":"Review the title and meta description for stronger query alignment, then strengthen the opening copy and supporting sections around the query.",
+        "CONTENT REFRESH":"Refresh the existing page rather than creating another URL. Improve topical depth, headings, internal links and intent alignment.",
+        "PUSH TO PAGE 1":"Expand the page around the search intent, add missing supporting subtopics/entities, strengthen internal links and improve the main content's usefulness.",
+        "RELEVANCE / CONTENT GAP":"First confirm this is the correct page for the query. If it is, expand the page substantially; if not, map the query to the correct existing service/location page.",
+        "REVIEW TARGET PAGE":"This is a commercially useful query but the ranking is weak. Check whether the current URL is the best service/location landing page before creating anything new.",
+        "MONITOR":"Low priority under the current filters. Do not spend optimization time here before higher-value opportunities."
+    }
+    return actions[r["Action"]]
+
+def build_plan(qp, locations, domain, min_imp, limit):
+    if qp.empty:return pd.DataFrame()
+    x=qp.copy()
+    x=x[x["Impressions"]>=min_imp].copy()
+    x["Intent"]=x["Query"].apply(lambda q:intent_for_query(q,locations))
+    x=x[~x["Query"].apply(lambda q:brand_query(q,domain))].copy()
+    x["Action"]=x.apply(choose_action,axis=1)
+    x["Opportunity Score"]=x.apply(score_row,axis=1)
+    # dominant page per query: prevents a long list of duplicate query/page rows
+    x["Page Share"]=x.groupby("Query")["Impressions"].transform(lambda s:s/max(s.sum(),1))
+    x["Page Signal"]=np.where(x["Page Share"]>=.6,"Primary page",np.where(x["Page Share"]>=.15,"Secondary page","Weak secondary"))
+    x=x.sort_values(["Opportunity Score","Impressions"],ascending=[False,False])
+    # Keep the best page for each query for the primary action plan
+    x=x.drop_duplicates("Query",keep="first")
+    x["Priority"]=pd.cut(x["Opportunity Score"],[-1,45,65,101],labels=["Low","Medium","High"]).astype(str)
+    x["Why"]=x.apply(lambda r:f"{r['Impressions']:,} impressions, position {r['Position']:.1f}, CTR {r['CTR']:.2%}, {r['Intent'].lower()} intent.",axis=1)
+    x["What to do"]=x.apply(recommendation_text,axis=1)
+    return x.head(limit)
+
+def crawl_page(url, timeout=12):
+    try:
+        r=requests.get(url,timeout=timeout,headers={"User-Agent":"Mozilla/5.0 (compatible; GSCContentOptimizer/1.0)"})
+        if r.status_code>=400:return {"URL":url,"Status":r.status_code,"Error":f"HTTP {r.status_code}"}
+        soup=BeautifulSoup(r.text,"html.parser")
+        title=(soup.title.get_text(" ",strip=True) if soup.title else "")
+        h1=[h.get_text(" ",strip=True) for h in soup.find_all("h1")]
+        hs=[h.get_text(" ",strip=True) for h in soup.find_all(["h2","h3"])]
+        canon=""
+        link=soup.find("link",rel=lambda v:v and "canonical" in v)
+        if link:canon=link.get("href","")
+        text=" ".join(soup.stripped_strings)
+        return {"URL":url,"Status":r.status_code,"Title":title,"H1":" | ".join(h1),"H2/H3":" | ".join(hs[:30]),"Canonical":canon,"Words":len(text.split()),"Error":""}
+    except Exception as e:
+        return {"URL":url,"Status":"Error","Error":str(e)}
+
+# ---------------------------
+# Sidebar settings
+# ---------------------------
 with st.sidebar:
-
     st.header("⚙️ Analysis Settings")
-
-    st.write(
-        "Upload a GSC ZIP exported from Google Search Console."
-    )
-
-    uploaded = st.file_uploader(
-        "Upload GSC ZIP",
-        type=["zip"]
-    )
-
+    source=st.radio("Data source",["Connect GSC","Upload GSC ZIP"],index=0)
     st.divider()
+    st.subheader("Business context")
+    domain=st.text_input("Website / GSC property",placeholder="https://example.com")
+    location_text=st.text_input("Target locations (comma-separated)",placeholder="Miami, Broward County, Palm Beach")
+    locations=[x.strip() for x in location_text.split(",") if x.strip()]
+    st.divider()
+    min_imp=st.number_input("Minimum impressions",10,100000,100,step=10)
+    limit=st.slider("Priority opportunities",10,50,25)
+    st.divider()
+    st.caption("The engine prioritizes opportunities; it does not claim that a change guarantees rankings.")
 
-    st.subheader("Opportunity Settings")
+# ---------------------------
+# Acquire data
+# ---------------------------
+qp=pd.DataFrame(); daily=pd.DataFrame(); page_df=pd.DataFrame(); query_df=pd.DataFrame()
+available_sites=[]
 
-    max_opportunities = st.slider(
-        "Number of opportunities",
-        min_value=5,
-        max_value=50,
-        value=15,
-        step=5
-    )
+if source=="Connect GSC":
+    if not hasattr(st,"login") or "auth" not in st.secrets:
+        st.error("Google login is not configured yet. Add the Streamlit [auth] secrets shown in the setup instructions below.")
+        st.stop()
+    if not st.user.is_logged_in:
+        st.subheader("🔐 Connect Google Search Console")
+        st.write("Sign in with the Google account that has access to the GSC property you want to analyze.")
+        st.button("Connect with Google",on_click=st.login)
+        st.info("The Google account used here can be different from the account that owns or deploys this Streamlit app.")
+        st.stop()
 
-    min_impressions = st.number_input(
-        "Minimum impressions",
-        min_value=0,
-        value=100,
-        step=50
-    )
+    st.sidebar.success(f"Connected: {getattr(st.user,'email','Google account')}")
+    if st.sidebar.button("Log out"):
+        st.logout()
 
+    try:
+        access_token=st.user.tokens["access"]
+        creds=Credentials(token=access_token,scopes=[GSC_SCOPE])
+        service=build("searchconsole","v1",credentials=creds,cache_discovery=False)
+        sites=service.sites().list().execute().get("siteEntry",[])
+        available_sites=[s.get("siteUrl") for s in sites if s.get("permissionLevel") in ["siteOwner","siteFullUser","siteRestrictedUser"]]
+    except Exception as e:
+        st.error("Could not access Search Console with the authorized account.")
+        st.code(str(e))
+        st.stop()
 
-# ============================================================
-# NO DATA
-# ============================================================
+    if not available_sites:
+        st.warning("No Search Console properties are available to this Google account.")
+        st.stop()
 
-if not uploaded:
+    selected_site=st.selectbox("GSC property",available_sites)
+    domain=selected_site
+    today=date.today()
+    # Search Console data can lag; use a conservative end date.
+    api_end=today-timedelta(days=3)
+    api_start=api_end-timedelta(days=89)
 
-    st.info(
-        "Upload your GSC ZIP from the sidebar to begin the analysis."
-    )
-
-    st.markdown("""
-### What this tool will identify
-
-🎯 **Striking-distance keywords**
-
-Keywords ranking around positions 4–10.
-
-📈 **Page 2 opportunities**
-
-Keywords ranking positions 11–20 with meaningful impressions.
-
-🎯 **CTR opportunities**
-
-Keywords receiving impressions but unusually low CTR.
-
-🛡️ **Protect keywords**
-
-Keywords already performing strongly.
-
-📄 **Page recommendations**
-
-Which existing page should be optimized.
-
-⚠️ **Cannibalization**
-
-Potential query/page competition when Query + Page data is available.
-
-📅 **Date analysis**
-
-Analyze different date ranges when daily query data is available.
-""")
-
-    st.stop()
-
-
-# ============================================================
-# READ DATA
-# ============================================================
-
-try:
-
-    files = read_zip(uploaded)
-
-except Exception as e:
-
-    st.error(f"Could not read ZIP: {e}")
-    st.stop()
-
-
-# ============================================================
-# IDENTIFY FILES
-# ============================================================
-
-query_file = None
-page_file = None
-chart_file = None
-
-for name, df in files.items():
-
-    name_lower = name.lower()
-
-    if "quer" in name_lower:
-        query_file = df
-
-    if "page" in name_lower:
-        page_file = df
-
-    if "chart" in name_lower:
-        chart_file = df
-
-
-queries = prepare_queries(query_file)
-pages = prepare_pages(page_file)
-chart = analyze_chart(chart_file)
-
-daily_query = detect_daily_query_data(files)
-
-
-# ============================================================
-# DATE RANGE
-# ============================================================
-
-st.markdown(
-    '<div class="section-title">📅 Analysis Period</div>',
-    unsafe_allow_html=True
-)
-
-date_min = None
-date_max = None
-
-if chart is not None:
-
-    date_col = find_column(chart, ["date"])
-
-    if date_col:
-
-        date_min = chart[date_col].min().date()
-        date_max = chart[date_col].max().date()
-
-
-if date_min and date_max:
-
-    total_days = (date_max - date_min).days + 1
-
-    st.success(
-        f"GSC data detected: **{date_min} → {date_max}** "
-        f"({total_days} days)"
-    )
-
-    range_type = st.selectbox(
-        "Choose analysis range",
-        [
-            "Full available period",
-            "Last 1 day",
-            "Last 2 days",
-            "Last 5 days",
-            "Last 7 days",
-            "Last 14 days",
-            "Last 30 days",
-            "Last 60 days",
-            "Custom range"
-        ]
-    )
-
-    if range_type == "Full available period":
-
-        start_date = date_min
-        end_date = date_max
-
-    elif range_type.startswith("Last"):
-
-        days = int(
-            re.search(
-                r"\d+",
-                range_type
-            ).group()
-        )
-
-        end_date = date_max
-        start_date = max(
-            date_min,
-            date_max - timedelta(days=days - 1)
-        )
-
+    range_options={"Last 1 day":1,"Last 2 days":2,"Last 5 days":5,"Last 7 days":7,"Last 14 days":14,"Last 30 days":30,"Last 60 days":60,"Last 90 days":90}
+    period=st.selectbox("Analysis period",list(range_options)+["Custom range"],index=5)
+    if period=="Custom range":
+        c1,c2=st.columns(2)
+        start=c1.date_input("Start",api_start,min_value=date(2018,1,1),max_value=api_end)
+        end=c2.date_input("End",api_end,min_value=start,max_value=api_end)
     else:
+        end=api_end
+        start=end-timedelta(days=range_options[period]-1)
+    st.caption(f"Selected: {start} → {end} ({(end-start).days+1} days)")
 
-        col1, col2 = st.columns(2)
+    with st.spinner("Pulling GSC query + page data..."):
+        raw=fetch_gsc(service,selected_site,start,end,["query","page"],25000)
+        daily=fetch_gsc(service,selected_site,start,end,["date"],25000)
 
-        with col1:
-
-            start_date = st.date_input(
-                "Start date",
-                value=date_min,
-                min_value=date_min,
-                max_value=date_max
-            )
-
-        with col2:
-
-            end_date = st.date_input(
-                "End date",
-                value=date_max,
-                min_value=date_min,
-                max_value=date_max
-            )
+    if not raw.empty:
+        qp=query_page_aggregate(raw)
+    if not daily.empty and "Date" in daily:
+        daily["Date"]=pd.to_datetime(daily["Date"])
 
 else:
+    upload=st.file_uploader("Upload GSC ZIP",type=["zip"])
+    if upload:
+        datasets=read_gsc_zip(upload)
+        st.success(f"ZIP processed. Detected {len(datasets)} readable file(s).")
+        with st.expander("Detected GSC files"):
+            st.write({n:k for n,(k,_) in datasets.items()})
+        for _,(kind,df) in datasets.items():
+            if kind=="query_page" and qp.empty: qp=df
+            elif kind=="query" and query_df.empty: query_df=df
+            elif kind=="page" and page_df.empty: page_df=df
+            elif kind=="daily" and daily.empty: daily=df
+        if not qp.empty:qp=query_page_aggregate(qp)
+        if daily.empty and query_df.empty:
+            st.warning("No usable Query or Daily dataset was found.")
+        if not qp.empty:
+            st.info("Query + Page data detected. Exact date filtering is available only when Date is also present in the same dataset; otherwise use GSC API mode.")
 
-    st.warning(
-        "No daily Chart.csv date data was detected. "
-        "The tool will analyze the available aggregate GSC data."
-    )
-
-    start_date = None
-    end_date = None
-
-
-# ============================================================
-# DATE VALIDATION
-# ============================================================
-
-if start_date and end_date:
-
-    selected_days = (
-        end_date - start_date
-    ).days + 1
-
-    st.caption(
-        f"Selected period: **{start_date} → {end_date}** "
-        f"({selected_days} days)"
-    )
-
-
-# ============================================================
-# DAILY DATA ANALYSIS
-# ============================================================
-
-if chart is not None and start_date and end_date:
-
-    date_col = find_column(chart, ["date"])
-
-    selected_chart = chart[
-        (
-            chart[date_col].dt.date >= start_date
-        )
-        &
-        (
-            chart[date_col].dt.date <= end_date
-        )
-    ].copy()
-
+# ---------------------------
+# Overview
+# ---------------------------
+st.subheader("📊 Performance Overview")
+if not daily.empty and {"Clicks","Impressions"}.issubset(daily.columns):
+    clicks=int(daily["Clicks"].sum()); imps=int(daily["Impressions"].sum()); ctr=clicks/imps if imps else 0
+    pos=np.nan
+    if "Position" in daily and daily["Position"].notna().any():
+        valid=daily["Position"].notna()
+        pos=np.average(daily.loc[valid,"Position"],weights=daily.loc[valid,"Impressions"])
+    a,b,c,d=st.columns(4)
+    a.metric("Clicks",f"{clicks:,}");b.metric("Impressions",f"{imps:,}");c.metric("CTR",f"{ctr:.2%}");d.metric("Avg. position","N/A" if np.isnan(pos) else f"{pos:.1f}")
 else:
+    st.info("Daily chart data is not available in this dataset.")
 
-    selected_chart = chart
+# ---------------------------
+# Main optimization plan
+# ---------------------------
+st.subheader("🎯 Priority Content Optimization Plan")
 
-
-# ============================================================
-# OVERVIEW METRICS
-# ============================================================
-
-st.markdown(
-    '<div class="section-title">📊 Performance Overview</div>',
-    unsafe_allow_html=True
-)
-
-if selected_chart is not None:
-
-    clicks_col = find_column(
-        selected_chart,
-        ["clicks"]
-    )
-
-    impressions_col = find_column(
-        selected_chart,
-        ["impressions"]
-    )
-
-    total_clicks = (
-        selected_chart[clicks_col].sum()
-        if clicks_col else 0
-    )
-
-    total_impressions = (
-        selected_chart[impressions_col].sum()
-        if impressions_col else 0
-    )
-
-    total_ctr = calculate_ctr(
-        total_clicks,
-        total_impressions
-    )
-
-else:
-
-    total_clicks = (
-        queries["clicks"].sum()
-        if queries is not None else 0
-    )
-
-    total_impressions = (
-        queries["impressions"].sum()
-        if queries is not None else 0
-    )
-
-    total_ctr = calculate_ctr(
-        total_clicks,
-        total_impressions
-    )
-
-
-metric1, metric2, metric3, metric4 = st.columns(4)
-
-with metric1:
-    st.metric(
-        "Clicks",
-        format_number(total_clicks)
-    )
-
-with metric2:
-    st.metric(
-        "Impressions",
-        format_number(total_impressions)
-    )
-
-with metric3:
-    st.metric(
-        "CTR",
-        f"{total_ctr:.2f}%"
-    )
-
-with metric4:
-
-    if queries is not None:
-
-        avg_position = queries["position"].mean()
-
-        st.metric(
-            "Avg. Position",
-            f"{avg_position:.1f}"
-        )
-
+if qp.empty and not query_df.empty:
+    # Query-only fallback
+    q=query_df.copy()
+    if {"Query","Clicks","Impressions","CTR","Position"}.issubset(q.columns):
+        q["Page"]="Page mapping unavailable"
+        qp=q[["Query","Page","Clicks","Impressions","CTR","Position"]]
+        plan=build_plan(qp,locations,domain,min_imp,limit)
+        if not plan.empty:
+            st.warning("This ZIP has keyword data but not reliable query→page mapping. Use Connect GSC for page-specific recommendations.")
+        else: st.success("No priority opportunities found under current filters.")
     else:
+        plan=pd.DataFrame()
+elif not qp.empty:
+    plan=build_plan(qp,locations,domain,min_imp,limit)
+else:
+    plan=pd.DataFrame()
 
-        st.metric(
-            "Avg. Position",
-            "N/A"
-        )
+if not plan.empty:
+    view=plan[["Priority","Query","Intent","Page","Impressions","Clicks","CTR","Position","Opportunity Score","Action","Page Signal"]].copy()
+    view["CTR"]=view["CTR"].map(lambda x:f"{x:.2%}")
+    view["Position"]=view["Position"].map(lambda x:f"{x:.1f}")
+    st.dataframe(view,use_container_width=True,hide_index=True)
+    st.download_button("⬇️ Download optimization plan CSV",plan.to_csv(index=False).encode("utf-8"),"gsc-optimization-plan.csv","text/csv")
 
-
-# ============================================================
-# DATA CONFIDENCE
-# ============================================================
-
-st.markdown(
-    '<div class="section-title">🔎 Data Quality</div>',
-    unsafe_allow_html=True
-)
-
-col1, col2, col3, col4 = st.columns(4)
-
-with col1:
-
-    st.metric(
-        "Query data",
-        "Available" if queries is not None else "Missing"
-    )
-
-with col2:
-
-    st.metric(
-        "Page data",
-        "Available" if pages is not None else "Missing"
-    )
-
-with col3:
-
-    st.metric(
-        "Daily query data",
-        "Available" if daily_query is not None else "Not available"
-    )
-
-with col4:
-
-    if date_min and date_max:
-
-        period_days = (
-            date_max - date_min
-        ).days + 1
-
-        if period_days >= 28:
-            confidence = "HIGH"
-        elif period_days >= 14:
-            confidence = "MEDIUM"
+    st.markdown("### 🔎 Detailed recommendations")
+    for i,r in plan.iterrows():
+        css="high" if r["Priority"]=="High" else "medium" if r["Priority"]=="Medium" else "low"
+        st.markdown(f"<span class='badge {css}'>{r['Priority']} PRIORITY</span> **{r['Query']}**",unsafe_allow_html=True)
+        c1,c2,c3,c4=st.columns(4)
+        c1.metric("Impressions",f"{int(r['Impressions']):,}")
+        c2.metric("Clicks",f"{int(r['Clicks']):,}")
+        c3.metric("CTR",f"{r['CTR']:.2%}")
+        c4.metric("Position",f"{r['Position']:.1f}")
+        st.write(f"**Recommended page:** `{r['Page']}`")
+        st.write(f"**Intent:** {r['Intent']}")
+        st.write(f"**Why selected:** {r['Why']}")
+        st.write(f"**Action:** {r['Action']}")
+        st.write(f"**What to change:** {r['What to do']}")
+        if r["Action"]=="PROTECT":
+            st.write("**Do not:** create another page or make a large rewrite without evidence of a problem.")
         else:
-            confidence = "LOW"
-
-    else:
-
-        confidence = "MEDIUM"
-
-    st.metric(
-        "Analysis confidence",
-        confidence
-    )
-
-
-if daily_query is None:
-
-    st.markdown("""
-<div class="warning-box">
-
-<b>Important:</b> Your current GSC ZIP contains aggregate query data.
-The tool can filter the site's daily performance using Chart.csv,
-but it cannot accurately recalculate keyword-level performance for
-a custom 1/2/5/7-day period.
-
-For true date-level keyword analysis, upload data containing:
-
-<b>Date + Query + Page + Clicks + Impressions + CTR + Position</b>.
-
-</div>
-""", unsafe_allow_html=True)
-
-
-# ============================================================
-# KEYWORD ANALYSIS
-# ============================================================
-
-if queries is None:
-
-    st.error(
-        "Queries.csv could not be detected."
-    )
-
-    st.stop()
-
-
-q = queries.copy()
-
-q = q[
-    q["impressions"] >= min_impressions
-].copy()
-
-q["opportunity_score"] = q.apply(
-    score_priority,
-    axis=1
-)
-
-q["opportunity_type"] = q.apply(
-    classify_opportunity,
-    axis=1
-)
-
-q["recommendation"] = q.apply(
-    recommendation,
-    axis=1
-)
-
-
-# ============================================================
-# REMOVE LOW PRIORITY
-# ============================================================
-
-priority_order = {
-    "STRIKING DISTANCE": 1,
-    "PAGE 2 OPPORTUNITY": 2,
-    "CTR OPPORTUNITY": 3,
-    "CONTENT OPPORTUNITY": 4,
-    "PROTECT": 5,
-    "LOW PRIORITY": 6
-}
-
-q["priority_order"] = q[
-    "opportunity_type"
-].map(priority_order)
-
-
-opportunities = q[
-    q["opportunity_type"] != "LOW PRIORITY"
-].sort_values(
-    [
-        "priority_order",
-        "opportunity_score",
-        "impressions"
-    ],
-    ascending=[True, False, False]
-).head(max_opportunities)
-
-
-# ============================================================
-# SUMMARY COUNTS
-# ============================================================
-
-st.markdown(
-    '<div class="section-title">🎯 Opportunity Summary</div>',
-    unsafe_allow_html=True
-)
-
-counts = q["opportunity_type"].value_counts()
-
-c1, c2, c3, c4 = st.columns(4)
-
-with c1:
-    st.metric(
-        "🚀 Striking Distance",
-        int(counts.get("STRIKING DISTANCE", 0))
-    )
-
-with c2:
-    st.metric(
-        "📄 Page 2",
-        int(counts.get("PAGE 2 OPPORTUNITY", 0))
-    )
-
-with c3:
-    st.metric(
-        "🎯 CTR",
-        int(counts.get("CTR OPPORTUNITY", 0))
-    )
-
-with c4:
-    st.metric(
-        "🛡️ Protect",
-        int(counts.get("PROTECT", 0))
-    )
-
-
-# ============================================================
-# TOP OPPORTUNITIES
-# ============================================================
-
-st.markdown(
-    '<div class="section-title">🔥 Top Optimization Opportunities</div>',
-    unsafe_allow_html=True
-)
-
-if opportunities.empty:
-
-    st.info(
-        "No significant optimization opportunities were found "
-        "using the current thresholds."
-    )
-
+            st.write("**Do not:** create a new URL for this query until the current ranking URL has been checked for intent, relevance and cannibalization.")
+        st.divider()
 else:
+    st.info("No priority plan yet. Connect GSC or upload a ZIP containing usable Query data.")
 
-    display = opportunities[
-        [
-            "query",
-            "clicks",
-            "impressions",
-            "ctr",
-            "position",
-            "opportunity_type",
-            "opportunity_score"
-        ]
-    ].copy()
+# ---------------------------
+# Page performance + cannibalization
+# ---------------------------
+st.subheader("📄 Page Opportunities & Cannibalization")
 
-    display.columns = [
-        "Keyword",
-        "Clicks",
-        "Impressions",
-        "CTR %",
-        "Position",
-        "Opportunity",
-        "Score"
-    ]
+if not qp.empty:
+    page=qp.groupby("Page",as_index=False).agg(Clicks=("Clicks","sum"),Impressions=("Impressions","sum"))
+    page["CTR"]=page["Clicks"]/page["Impressions"].replace(0,np.nan)
+    tmp=qp.copy()
+    tmp["wpos"]=tmp["Position"]*tmp["Impressions"]
+    wp=tmp.groupby("Page",as_index=False)["wpos"].sum()
+    page=page.merge(wp,on="Page");page["Position"]=page["wpos"]/page["Impressions"].replace(0,np.nan)
+    page=page.drop(columns="wpos").sort_values("Impressions",ascending=False)
+    st.dataframe(page.head(limit).assign(CTR=lambda x:x["CTR"].map(lambda v:f"{v:.2%}"),Position=lambda x:x["Position"].map(lambda v:f"{v:.1f}")),use_container_width=True,hide_index=True)
 
-    st.dataframe(
-        display,
-        use_container_width=True,
-        hide_index=True
-    )
-
-
-# ============================================================
-# DETAILED ANALYSIS
-# ============================================================
-
-st.markdown(
-    '<div class="section-title">🔬 Detailed Recommendations</div>',
-    unsafe_allow_html=True
-)
-
-for index, row in opportunities.iterrows():
-
-    keyword = row["query"]
-
-    score = int(
-        row["opportunity_score"]
-    )
-
-    opportunity = row[
-        "opportunity_type"
-    ]
-
-    if opportunity == "STRIKING DISTANCE":
-        badge = "🔴 HIGH PRIORITY"
-
-    elif opportunity == "PAGE 2 OPPORTUNITY":
-        badge = "🟠 MEDIUM-HIGH PRIORITY"
-
-    elif opportunity == "CTR OPPORTUNITY":
-        badge = "🟡 CTR PRIORITY"
-
-    elif opportunity == "PROTECT":
-        badge = "🟢 PROTECT"
-
+    c=qp.copy()
+    c["Share"]=c.groupby("Query")["Impressions"].transform(lambda s:s/max(s.sum(),1))
+    signals=c[(c["Share"]>=.15)&(c["Share"]<.85)].sort_values("Impressions",ascending=False)
+    st.markdown("#### Potential multi-URL query signals")
+    if signals.empty:
+        st.success("No strong multi-URL signals found in the current data.")
     else:
-        badge = "🔵 OPPORTUNITY"
-
-    with st.expander(
-        f"{badge}  |  {keyword}  |  Score {score}/100"
-    ):
-
-        col1, col2, col3, col4 = st.columns(4)
-
-        with col1:
-            st.metric(
-                "Position",
-                f"{row['position']:.1f}"
-            )
-
-        with col2:
-            st.metric(
-                "Impressions",
-                format_number(row["impressions"])
-            )
-
-        with col3:
-            st.metric(
-                "Clicks",
-                format_number(row["clicks"])
-            )
-
-        with col4:
-            st.metric(
-                "CTR",
-                f"{row['ctr']:.2f}%"
-            )
-
-        st.markdown("### What is happening?")
-
-        if opportunity == "STRIKING DISTANCE":
-
-            st.write(
-                "This keyword is already ranking on page 1 but "
-                "has room to move into stronger positions."
-            )
-
-        elif opportunity == "PAGE 2 OPPORTUNITY":
-
-            st.write(
-                "This keyword has meaningful search visibility "
-                "but the ranking page is currently on page 2."
-            )
-
-        elif opportunity == "CTR OPPORTUNITY":
-
-            st.write(
-                "The page has visibility but the CTR appears "
-                "low relative to its ranking opportunity."
-            )
-
-        elif opportunity == "PROTECT":
-
-            st.write(
-                "This keyword is already performing strongly. "
-                "Major content changes may introduce unnecessary risk."
-            )
-
-        else:
-
-            st.write(
-                "This keyword has enough visibility to justify "
-                "further content investigation."
-            )
-
-        st.markdown("### Why prioritize it?")
-
-        st.write(
-            f"The keyword generated "
-            f"**{format_number(row['impressions'])} impressions** "
-            f"and currently ranks around "
-            f"**position {row['position']:.1f}**."
-        )
-
-        st.markdown("### Recommended action")
-
-        st.write(
-            row["recommendation"]
-        )
-
-        if opportunity != "PROTECT":
-
-            st.markdown("### Content optimization checklist")
-
-            st.markdown("""
-- Review whether the current page fully satisfies the search intent.
-- Strengthen the main topic in the introduction.
-- Review H1 and H2/H3 structure.
-- Add missing supporting subtopics.
-- Improve topical depth without keyword stuffing.
-- Add useful FAQs where relevant.
-- Strengthen contextual internal links.
-- Review title and meta description when CTR is weak.
-- Avoid creating another URL if an existing relevant page already ranks.
-""")
-
-        else:
-
-            st.success(
-                "Protect this keyword and avoid unnecessary major changes."
-            )
-
-
-# ============================================================
-# PAGE ANALYSIS
-# ============================================================
-
-if pages is not None:
-
-    st.markdown(
-        '<div class="section-title">📄 Pages With Highest SEO Opportunity</div>',
-        unsafe_allow_html=True
-    )
-
-    page_df = pages.copy()
-
-    page_df["score"] = page_df.apply(
-        score_priority,
-        axis=1
-    )
-
-    page_df = page_df.sort_values(
-        ["score", "impressions"],
-        ascending=False
-    ).head(20)
-
-    st.dataframe(
-        page_df[
-            [
-                "page",
-                "clicks",
-                "impressions",
-                "ctr",
-                "position",
-                "score"
-            ]
-        ],
-        use_container_width=True,
-        hide_index=True
-    )
-
-
-# ============================================================
-# CANNIBALIZATION
-# ============================================================
-
-st.markdown(
-    '<div class="section-title">⚠️ Cannibalization Check</div>',
-    unsafe_allow_html=True
-)
-
-if daily_query is not None:
-
-    dq = normalize_columns(
-        daily_query.copy()
-    )
-
-    query_col = find_column(
-        dq,
-        ["query", "queries", "keyword"]
-    )
-
-    page_col = find_column(
-        dq,
-        ["page", "url", "top_pages"]
-    )
-
-    if query_col and page_col:
-
-        mapping = dq[
-            [query_col, page_col]
-        ].dropna()
-
-        grouped = (
-            mapping.groupby(query_col)[page_col]
-            .nunique()
-            .sort_values(
-                ascending=False
-            )
-        )
-
-        cannibalization = grouped[
-            grouped >= 2
-        ].head(20)
-
-        if len(cannibalization):
-
-            st.warning(
-                f"{len(cannibalization)} queries have multiple "
-                "ranking URLs in the supplied dataset."
-            )
-
-            for query, count in cannibalization.items():
-
-                urls = (
-                    mapping[
-                        mapping[query_col] == query
-                    ][page_col]
-                    .drop_duplicates()
-                    .tolist()
-                )
-
-                st.write(
-                    f"**{query}** — {count} URLs"
-                )
-
-                for url in urls:
-                    st.write(
-                        f"- {url}"
-                    )
-
-        else:
-
-            st.success(
-                "No obvious multi-page query competition detected."
-            )
-
-    else:
-
-        st.info(
-            "Query + Page mapping is required for a reliable "
-            "cannibalization analysis."
-        )
-
+        st.warning("These are signals for review, not automatic cannibalization verdicts.")
+        st.dataframe(signals[["Query","Page","Impressions","Clicks","Position","Share"]].head(100).assign(Share=lambda x:x["Share"].map(lambda v:f"{v:.1%}")),use_container_width=True,hide_index=True)
 else:
+    st.info("Query + Page data is required for reliable page mapping and cannibalization signals.")
 
-    st.info(
-        "Cannibalization analysis requires Date + Query + Page data "
-        "or another dataset that directly maps queries to URLs."
-    )
+# ---------------------------
+# Optional live page audit
+# ---------------------------
+st.subheader("🧪 Optional Page Content Check")
+st.caption("This checks the selected pages' HTML signals. It does not replace a full technical audit.")
 
+if not plan.empty:
+    pages=plan["Page"].dropna().astype(str).tolist()
+    selected=st.multiselect("Select pages to inspect",pages,max_selections=10)
+    if st.button("Check selected pages"):
+        results=[]
+        for u in selected:
+            if not u.startswith("http"):
+                st.warning(f"Skipped non-URL: {u}")
+                continue
+            results.append(crawl_page(u))
+        if results:
+            st.dataframe(pd.DataFrame(results),use_container_width=True,hide_index=True)
+            st.info("Use these checks to validate whether title/H1/headings/canonical/word count support the GSC recommendation.")
 
-# ============================================================
-# EXPORT
-# ============================================================
-
-st.markdown(
-    '<div class="section-title">📥 Export Optimization Plan</div>',
-    unsafe_allow_html=True
-)
-
-export_columns = [
-    "query",
-    "clicks",
-    "impressions",
-    "ctr",
-    "position",
-    "opportunity_type",
-    "opportunity_score",
-    "recommendation"
-]
-
-export_df = opportunities[
-    [
-        c for c in export_columns
-        if c in opportunities.columns
-    ]
-].copy()
-
-csv_data = export_df.to_csv(
-    index=False
-).encode("utf-8")
-
-st.download_button(
-    label="⬇️ Download SEO Optimization Plan",
-    data=csv_data,
-    file_name="gsc-content-optimization-plan.csv",
-    mime="text/csv"
-)
-
-
-# ============================================================
-# FOOTER
-# ============================================================
-
-st.divider()
-
-st.caption(
-    "GSC Content Optimizer — rule-based analysis. "
-    "Recommendations should be reviewed against actual page content "
-    "and search intent before implementation."
-)
+# ---------------------------
+# Data quality
+# ---------------------------
+st.subheader("🔍 Data Quality")
+if source=="Connect GSC":
+    st.success("HIGH confidence for the selected GSC API range when Query + Page and Date data are returned.")
+    st.caption("Search Console API returns top rows and does not guarantee every possible query/page row. Treat the plan as a prioritized opportunity set, not a complete inventory.")
+else:
+    st.caption("ZIP confidence depends on which dimensions are present. Separate Queries.csv and Pages.csv cannot prove which page ranks for a particular query.")
